@@ -1133,4 +1133,78 @@ class ExecutorPodsAllocatorSuite extends SparkFunSuite with BeforeAndAfter {
     podsAllocator.setRecoveryMode()
     assert(!newConf.get(KUBERNETES_ALLOCATION_RECOVERY_MODE_ENABLED).get)
   }
+
+  test("SPARK-44609: an executor known by the scheduler backend that disconnects before" +
+      " its pod is ever seen in a snapshot must not permanently reserve its executor slot") {
+    // Request 2 executors.
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 2))
+    assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 2)
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(1))
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(2))
+
+    // Executor 2's pod becomes visible as Pending in a snapshot, as normal. Executor 1
+    // registers with the driver over RPC (the scheduler backend now reports it as known),
+    // but its pod is *never* observed by either the watch or the polling snapshot sources
+    // (e.g. the watch missed the pod's creation event). Executor 1 is moved into the
+    // "known by the scheduler backend but never seen in a snapshot" bucket.
+    snapshotsStore.updatePod(pendingExecutor(2))
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("1"))
+    snapshotsStore.notifySubscribers()
+    // Both executor 1 (presumed alive) and executor 2 (pending) count toward the target,
+    // so no new pod should be requested yet.
+    verify(podsWithNamespace, times(2)).resource(any())
+
+    // Simulate the SPARK-44609 race: executor 1 is killed very quickly (e.g. OOMKilled)
+    // before its pod was ever observed in a snapshot. The driver's RPC layer detects the
+    // disconnection (TCP disconnect or heartbeat timeout, exactly like a real executor
+    // loss) and the scheduler backend no longer reports it as known.
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq.empty)
+    snapshotsStore.notifySubscribers()
+
+    // EXPECTED (correct) behavior: once the scheduler backend confirms executor 1 is gone,
+    // the allocator should immediately request a real replacement for it, without waiting
+    // for any timeout.
+    //
+    // BUG (current behavior): schedulerKnownNewlyCreatedExecs is never re-checked against
+    // the scheduler backend after the initial transfer, so executor 1 remains tracked
+    // forever even though it is definitely gone. No replacement is ever requested, and
+    // with dynamicAllocation.minExecutors=0 the application can get permanently stuck
+    // with zero real executors.
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(3))
+  }
+  test("SPARK-44609: a healthy executor known by the scheduler backend must not be" +
+      " removed just because its pod has not appeared in a snapshot yet") {
+    // Request 1 executor.
+    podsAllocatorUnderTest.setTotalExpectedExecutors(Map(defaultProfile -> 1))
+    verify(podsWithNamespace).resource(podWithAttachedContainerForId(1))
+
+    // Executor 1 registers with the driver (scheduler backend reports it as known), but
+    // its pod has not yet appeared in any snapshot -- this is the normal, healthy window
+    // that exists for every executor between RPC registration and the next watch/poll
+    // cycle, *not* a ghost.
+    when(schedulerBackend.getExecutorIds()).thenReturn(Seq("1"))
+    snapshotsStore.notifySubscribers()
+
+    // Re-run several allocation cycles, advancing the clock each time, while executor 1
+    // remains known to the scheduler backend throughout (it never disconnects) and its
+    // pod still never happens to show up in a snapshot. A healthy, still-connected
+    // executor must stay tracked and must NOT be replaced, no matter how much time passes
+    // or how many cycles run.
+    for (_ <- 1 to 5) {
+      waitForExecutorPodsClock.advance(podCreationTimeout * 2)
+      snapshotsStore.notifySubscribers()
+    }
+
+    verify(podsWithNamespace, never()).resource(podWithAttachedContainerForId(2))
+    assert(podsAllocatorUnderTest.invokePrivate(numOutstandingPods).get() == 0,
+      "a healthy executor that is still known to the scheduler backend must continue to " +
+        "count as fulfilling the target, even though its pod was never seen in a snapshot")
+
+    // Now executor 1 finally does show up in a snapshot (e.g. the watch/poll finally
+    // caught up) -- this is the normal resolution path, unrelated to our fix, and must
+    // continue to work: no replacement should ever be requested for it.
+    snapshotsStore.updatePod(runningExecutor(1))
+    snapshotsStore.notifySubscribers()
+    verify(podsWithNamespace, never()).resource(podWithAttachedContainerForId(2))
+  }
 }
