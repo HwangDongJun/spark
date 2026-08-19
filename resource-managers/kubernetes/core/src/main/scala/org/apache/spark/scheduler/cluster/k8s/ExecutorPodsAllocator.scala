@@ -226,6 +226,16 @@ class ExecutorPodsAllocator(
         .map { case (k, v) => (k, v._1) }
     newlyCreatedExecutors --= schedulerKnownNewlyCreatedExecs.keySet
 
+    // SPARK-44609: An executor that the scheduler backend previously reported as known
+    // may have since disconnected (e.g. it registered and was killed again before its
+    // pod was ever observed in a snapshot -- the watch missed the pod's creation event
+    // and it was removed again before the next poll). Once the scheduler backend no
+    // longer reports it, stop tracking it here too; otherwise it would be silently and
+    // permanently counted as an allocated executor slot that will never actually run
+    // (see SPARK-44609 / SPARK-52589).
+    schedulerKnownNewlyCreatedExecs --=
+      schedulerKnownNewlyCreatedExecs.keySet.diff(schedulerKnownExecs)
+
     // For all executors we've created against the API but have not seen in a snapshot
     // yet - check the current time. If the current time has exceeded some threshold,
     // assume that the pod was either never created (the API server never properly
