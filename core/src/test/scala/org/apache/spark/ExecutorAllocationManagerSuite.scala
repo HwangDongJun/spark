@@ -17,7 +17,7 @@
 
 package org.apache.spark
 
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{Semaphore, TimeUnit}
 
 import scala.collection.mutable
 
@@ -35,6 +35,7 @@ import org.apache.spark.resource._
 import org.apache.spark.resource.ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster.ExecutorInfo
+import org.apache.spark.status.AppStatusStore
 import org.apache.spark.util.{Clock, ManualClock, SystemClock}
 
 /**
@@ -117,6 +118,401 @@ class ExecutorAllocationManagerSuite extends SparkFunSuite {
     assert(numExecutorsTargetForDefaultProfileId(manager) === 1)
     assert(executorsPendingToRemove(manager).isEmpty)
     assert(addTime(manager) === ExecutorAllocationManager.NOT_SET)
+  }
+
+  // ============================================================================================
+  // [SPIKE-ONLY, SPARK-58935] v2 design: reconciled stages are never patched into
+  // stageAttemptToTaskIndices/stageAttemptToNumRunningTask. Instead they are read fresh from
+  // AppStatusStore for as long as they remain "recovered" (until stage completion). See
+  // SPARK-58935-SELF-HEALING-DESIGN.md sec 15.
+  // ============================================================================================
+
+  test("SPIKE: dropped StageSubmitted self-heals via AppStatusStore reconciliation") {
+    val conf = createConf(0, 5, 0)
+      .set("spark.scheduler.listenerbus.eventqueue.executorManagement.capacity", "1")
+
+    val customBus = new LiveListenerBus(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    customBus.addToStatusQueue(statusStore.listener.get)  // unconstrained: always succeeds
+
+    val blockStarted = new Semaphore(0)
+    val blockRelease = new Semaphore(0)
+    customBus.addToManagementQueue(new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        blockStarted.release()
+        blockRelease.acquire()
+      }
+    })
+    customBus.start(null, mock(classOf[MetricsSystem]))
+
+    val rpManagerLocal = new ResourceProfileManager(conf, customBus)
+    val manager = new ExecutorAllocationManager(client, customBus, conf, clock = new SystemClock(),
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => Some(statusStore))
+    manager.start()
+
+    try {
+      customBus.post(SparkListenerJobStart(0, 0, Seq.empty))
+      blockStarted.acquire()
+      // One post() call, delivered differently per queue: dropped on executorManagement
+      // (capacity 1, already full), delivered normally on appStatus (unconstrained).
+      customBus.post(SparkListenerJobStart(1, 0, Seq.empty))  // fills the single slot
+      val stageInfo = createStageInfo(0, 2)
+      stageInfo.submissionTime = Some(System.currentTimeMillis())
+      customBus.post(SparkListenerStageSubmitted(stageInfo))
+
+      blockRelease.release(2)
+      customBus.waitUntilEmpty()
+
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 0,
+        "expected the dropped stage-submitted event to leave the manager thinking no " +
+          "executors are needed, before reconciliation runs")
+      assert(statusStore.activeStages().exists(_.stageId == 0),
+        "expected AppStatusStore to have this stage via the non-dropping appStatus queue")
+
+      manager invokePrivate _schedule()
+
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 2,
+        "expected reconciliation to recover the missing stage's 2 pending tasks " +
+          "(default profile: 1 task per executor, so ceil(2/1) = 2)")
+    } finally {
+      manager.stop()
+      customBus.stop()
+    }
+  }
+
+  test("SPIKE: reconcile() does not resurrect a stage already completed on our side") {
+    val conf = createConf(0, 5, 0)
+    val manager = createManager(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+
+    val stageInfo = createStageInfo(0, 2)
+    stageInfo.submissionTime = Some(System.currentTimeMillis())
+
+    // Our side (via the shared listenerBus fixture): submitted, then normally completed.
+    post(SparkListenerStageSubmitted(stageInfo))
+    post(SparkListenerStageCompleted(stageInfo))
+
+    // Simulate AppStatusStore's own queue having independently dropped the StageCompleted
+    // event: feed it the submission directly (bypassing any bus) and never tell it the stage
+    // completed, so its view is stale/still-active, independent of what happened on our side.
+    statusStore.listener.get.onStageSubmitted(SparkListenerStageSubmitted(stageInfo))
+    assert(statusStore.activeStages().exists(_.stageId == 0),
+      "test setup: AppStatusStore's independent (stale) copy should still show this active")
+
+    manager.listener.reconcile(statusStore)
+
+    assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 0,
+      "reconcile() must not resurrect a stage this manager already completed normally, " +
+        "even though AppStatusStore's own copy is (independently) stale")
+  }
+
+  test("SPIKE: reconcile() recovers multiple stages dropped in the same burst") {
+    val conf = createConf(0, 20, 0)
+      .set("spark.scheduler.listenerbus.eventqueue.executorManagement.capacity", "1")
+    val customBus = new LiveListenerBus(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    customBus.addToStatusQueue(statusStore.listener.get)
+
+    val blockStarted = new Semaphore(0)
+    val blockRelease = new Semaphore(0)
+    customBus.addToManagementQueue(new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        blockStarted.release()
+        blockRelease.acquire()
+      }
+    })
+    customBus.start(null, mock(classOf[MetricsSystem]))
+
+    val rpManagerLocal = new ResourceProfileManager(conf, customBus)
+    val manager = new ExecutorAllocationManager(client, customBus, conf, clock = new SystemClock(),
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => Some(statusStore))
+    manager.start()
+
+    try {
+      customBus.post(SparkListenerJobStart(0, 0, Seq.empty))
+      blockStarted.acquire()
+      customBus.post(SparkListenerJobStart(1, 0, Seq.empty))  // fills the single slot
+
+      val stageInfos = (0 until 3).map { i =>
+        val info = createStageInfo(i, 2)
+        info.submissionTime = Some(System.currentTimeMillis())
+        info
+      }
+      stageInfos.foreach(info => customBus.post(SparkListenerStageSubmitted(info)))
+
+      blockRelease.release(4)
+      customBus.waitUntilEmpty()
+
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 0,
+        "all three stages should be unknown to the manager before reconciliation")
+      assert(statusStore.activeStages().size === 3,
+        "test setup: AppStatusStore should have all three stages via the appStatus queue")
+
+      manager invokePrivate _schedule()
+
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 6,
+        "expected reconciliation to recover all three stages' pending tasks in a single " +
+          "schedule() cycle (3 stages * 2 tasks each = 6)")
+    } finally {
+      manager.stop()
+      customBus.stop()
+    }
+  }
+
+  test("SPIKE: pre-existing TaskStart progress is correctly reflected via ground truth, " +
+      "not double-counted") {
+    val conf = createConf(0, 20, 0)
+      .set("spark.scheduler.listenerbus.eventqueue.executorManagement.capacity", "1")
+    val customBus = new LiveListenerBus(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    customBus.addToStatusQueue(statusStore.listener.get)
+
+    val blockStarted = new Semaphore(0)
+    val blockRelease = new Semaphore(0)
+    customBus.addToManagementQueue(new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        blockStarted.release()
+        blockRelease.acquire()
+      }
+    })
+    customBus.start(null, mock(classOf[MetricsSystem]))
+
+    val rpManagerLocal = new ResourceProfileManager(conf, customBus)
+    val manager = new ExecutorAllocationManager(client, customBus, conf, clock = new SystemClock(),
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => Some(statusStore))
+    manager.start()
+
+    try {
+      customBus.post(SparkListenerJobStart(0, 0, Seq.empty))
+      blockStarted.acquire()
+      customBus.post(SparkListenerJobStart(1, 0, Seq.empty))  // fills the single slot
+      val stageInfo = createStageInfo(0, 3)
+      stageInfo.submissionTime = Some(System.currentTimeMillis())
+      customBus.post(SparkListenerStageSubmitted(stageInfo))  // dropped on executorManagement
+      blockRelease.release(2)
+      customBus.waitUntilEmpty()
+
+      // The queue has drained now, so this TaskStart for the "unknown" stage is delivered
+      // normally on our side, and normally on the appStatus side too -- ground truth (via
+      // AppStatusStore) will reflect it regardless of what our own per-task maps do with it.
+      customBus.post(SparkListenerTaskStart(0, 0, createTaskInfo(0, 0, "executor-1")))
+      customBus.waitUntilEmpty()
+
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 0,
+        "still 0 before reconciliation: the stage is unknown so nothing is counted yet")
+
+      manager invokePrivate _schedule()
+
+      // 1 already-running task + 2 still-pending tasks = 3 total, matching the stage's real
+      // numTasks -- read straight from AppStatusStore's ground truth, no double-counting risk.
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 3,
+        "expected the pre-existing TaskStart's progress (1 running) to combine correctly " +
+          "with the recovered stage's total (3 tasks)")
+    } finally {
+      manager.stop()
+      customBus.stop()
+    }
+  }
+
+  test("SPIKE: a task that fails and needs retry after reconciliation is correctly " +
+      "re-counted as pending (no phantom-index bookkeeping to go stale)") {
+    val conf = createConf(0, 20, 0)
+      .set("spark.scheduler.listenerbus.eventqueue.executorManagement.capacity", "1")
+    val customBus = new LiveListenerBus(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    customBus.addToStatusQueue(statusStore.listener.get)
+
+    val blockStarted = new Semaphore(0)
+    val blockRelease = new Semaphore(0)
+    customBus.addToManagementQueue(new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        blockStarted.release()
+        blockRelease.acquire()
+      }
+    })
+    customBus.start(null, mock(classOf[MetricsSystem]))
+
+    val rpManagerLocal = new ResourceProfileManager(conf, customBus)
+    val manager = new ExecutorAllocationManager(client, customBus, conf, clock = new SystemClock(),
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => Some(statusStore))
+    manager.start()
+
+    try {
+      customBus.post(SparkListenerJobStart(0, 0, Seq.empty))
+      blockStarted.acquire()
+      customBus.post(SparkListenerJobStart(1, 0, Seq.empty))
+      val stageInfo = createStageInfo(0, 3)
+      stageInfo.submissionTime = Some(System.currentTimeMillis())
+      customBus.post(SparkListenerStageSubmitted(stageInfo))  // dropped
+      blockRelease.release(2)
+      customBus.waitUntilEmpty()
+
+      val taskInfo = createTaskInfo(0, 0, "executor-1")
+      customBus.post(SparkListenerTaskStart(0, 0, taskInfo))
+      customBus.waitUntilEmpty()
+
+      manager invokePrivate _schedule()
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 3,
+        "sanity check: 1 running + 2 pending = 3, as in the previous test")
+
+      // Task 0 now FAILS (not Success, not TaskKilled) and needs a retry.
+      customBus.post(SparkListenerTaskEnd(0, 0, "resultFetch", UnknownReason, taskInfo,
+        new ExecutorMetrics, null))
+      customBus.waitUntilEmpty()
+
+      // No reconcile() re-run needed -- ground truth is read fresh on every
+      // maxNumExecutorsNeededPerResourceProfile() call for a recovered stage. Expect 3 needed:
+      // 0 running (the failed task's slot is no longer active) + 3 pending (all 3 need doing,
+      // since the failed one needs a retry and the other 2 never started).
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 3,
+        "expected the failed task to be correctly re-counted as pending via fresh ground " +
+          "truth, with no phantom-index bookkeeping to go stale")
+    } finally {
+      manager.stop()
+      customBus.stop()
+    }
+  }
+
+  test("SPIKE: a real StageSubmitted arriving after reconciliation already recovered the " +
+      "same stage is safe (not a true drop, just delayed)") {
+    val conf = createConf(0, 20, 0)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    // Not using the createManager(..) helper here: it doesn't wire statusStoreProvider, and
+    // this test calls reconcile()/handleStageSubmitted() directly rather than going through a
+    // real drop, so the manager needs the provider set up explicitly.
+    ResourceProfile.reInitDefaultProfile(conf)
+    val rpManagerLocal = new ResourceProfileManager(conf, listenerBus)
+    val manager = new ExecutorAllocationManager(client, listenerBus, conf,
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => Some(statusStore))
+    managers += manager
+    manager.start()
+
+    val stageInfo = createStageInfo(0, 2,
+      taskLocalityPreferences = Seq(Seq(TaskLocation("host1")), Seq(TaskLocation("host2"))))
+    stageInfo.submissionTime = Some(System.currentTimeMillis())
+    statusStore.listener.get.onStageSubmitted(SparkListenerStageSubmitted(stageInfo))
+
+    manager.listener.reconcile(statusStore)  // synthetically recovers with Nil locality hints
+    assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 2,
+      "sanity check: recovered via reconciliation as usual")
+
+    // The "real" (backlogged, not actually dropped) event now finally arrives normally.
+    manager.listener.handleStageSubmitted(stageInfo)
+
+    assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 2,
+      "a second, real handleStageSubmitted call for the same stage attempt must not double-" +
+        "count -- resourceProfileIdToStageAttempt is a Set (idempotent add), " +
+        "stageAttemptToNumTasks is just overwritten with the same value, and the pending/" +
+        "running calculation still comes from ground truth regardless (recoveredStageAttempts " +
+        "is untouched by handleStageSubmitted)")
+  }
+
+  test("SPIKE: a failed reconcile attempt is retried on the next schedule() tick, even " +
+      "without a new drop") {
+    val conf = createConf(0, 5, 0)
+      .set("spark.scheduler.listenerbus.eventqueue.executorManagement.capacity", "1")
+
+    val customBus = new LiveListenerBus(conf)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    customBus.addToStatusQueue(statusStore.listener.get)  // unconstrained: always succeeds
+
+    val blockStarted = new Semaphore(0)
+    val blockRelease = new Semaphore(0)
+    customBus.addToManagementQueue(new SparkListener {
+      override def onJobStart(jobStart: SparkListenerJobStart): Unit = {
+        blockStarted.release()
+        blockRelease.acquire()
+      }
+    })
+    customBus.start(null, mock(classOf[MetricsSystem]))
+
+    var providerCalls = 0
+    val rpManagerLocal = new ResourceProfileManager(conf, customBus)
+    val manager = new ExecutorAllocationManager(client, customBus, conf, clock = new SystemClock(),
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => {
+        providerCalls += 1
+        // Fails only the first time this is actually invoked (i.e. the first reconcile
+        // attempt), simulating a transient failure (e.g. AppStatusStore momentarily
+        // unavailable). Every later call succeeds.
+        if (providerCalls == 1) throw new RuntimeException("simulated transient failure")
+        Some(statusStore)
+      })
+    manager.start()
+
+    try {
+      customBus.post(SparkListenerJobStart(0, 0, Seq.empty))
+      blockStarted.acquire()
+      // One post() call, delivered differently per queue: dropped on executorManagement
+      // (capacity 1, already full), delivered normally on appStatus (unconstrained).
+      customBus.post(SparkListenerJobStart(1, 0, Seq.empty))  // fills the single slot
+      val stageInfo = createStageInfo(0, 2)
+      stageInfo.submissionTime = Some(System.currentTimeMillis())
+      customBus.post(SparkListenerStageSubmitted(stageInfo))
+
+      blockRelease.release(2)
+      customBus.waitUntilEmpty()
+
+      // First tick: statusStoreProvider throws. In production this is caught (and logged) by
+      // Utils.tryLog at the schedule() call site; calling schedule() directly here bypasses
+      // that wrapper, so the test catches it itself instead.
+      intercept[RuntimeException] {
+        manager invokePrivate _schedule()
+      }
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 0,
+        "the failed first attempt must not have recovered anything")
+
+      // Second tick, with no new drop in between (numDroppedExecutorManagementEvents is
+      // unchanged since the first tick): must still retry, proving the failed first attempt
+      // did not consume the trigger -- lastSeenDroppedEvents is only updated *after*
+      // reconcile() returns without throwing, not before calling it.
+      manager invokePrivate _schedule()
+      assert(manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id) === 2,
+        "expected the retried reconcile to recover the stage's 2 pending tasks even though " +
+          "no new drop happened after the first (failed) attempt")
+    } finally {
+      manager.stop()
+      customBus.stop()
+    }
+  }
+
+  test("SPIKE: a single maxNumExecutorsNeededPerResourceProfile() call queries " +
+      "AppStatusStore at most once per recovered stage attempt") {
+    val conf = createConf(0, 5, 0)
+    val statusStore = AppStatusStore.createLiveStore(conf)
+    ResourceProfile.reInitDefaultProfile(conf)
+    val rpManagerLocal = new ResourceProfileManager(conf, listenerBus)
+
+    var providerCalls = 0
+    val manager = new ExecutorAllocationManager(client, listenerBus, conf,
+      resourceProfileManager = rpManagerLocal, reliableShuffleStorage = false,
+      statusStoreProvider = () => {
+        providerCalls += 1
+        Some(statusStore)
+      })
+    managers += manager
+    manager.start()
+
+    val stageInfo = createStageInfo(0, 2)
+    stageInfo.submissionTime = Some(System.currentTimeMillis())
+    statusStore.listener.get.onStageSubmitted(SparkListenerStageSubmitted(stageInfo))
+
+    manager.listener.reconcile(statusStore)  // takes the store as a parameter directly
+    assert(providerCalls === 0,
+      "sanity check: reconcile(store) must not itself call statusStoreProvider")
+
+    manager.maxNumExecutorsNeededPerResourceProfile(defaultProfile.id)
+
+    assert(providerCalls === 1,
+      "expected a single AppStatusStore lookup for the one recovered stage attempt within " +
+        "one maxNumExecutorsNeededPerResourceProfile() call -- getPendingTaskSum and " +
+        "totalRunningTasksPerResourceProfile must share one cached ground-truth read, not " +
+        "query AppStatusStore once each for the same attempt")
   }
 
   test("add executors default profile") {

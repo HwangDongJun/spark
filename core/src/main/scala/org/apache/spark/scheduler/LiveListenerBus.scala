@@ -82,6 +82,15 @@ private[spark] class LiveListenerBus(conf: SparkConf) {
   }
 
   /**
+   * [SPIKE-ONLY, SPARK-58935] The number of events dropped from the executor management queue
+   * since this bus was started. Internal plumbing for ExecutorAllocationManager's
+   * reconciliation trigger -- see SPARK-58935-SELF-HEALING-DESIGN.md.
+   */
+  private[spark] def numDroppedExecutorManagementEvents: Long = {
+    metrics.metricRegistry.counter(s"queue.$EXECUTOR_MANAGEMENT_QUEUE.numDroppedEvents").getCount
+  }
+
+  /**
    * Add a listener to a specific queue, creating a new queue if needed. Queues are independent
    * of each other (each one uses a separate thread for delivering events), allowing slower
    * listeners to be somewhat isolated from others.
