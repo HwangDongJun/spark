@@ -673,6 +673,17 @@ private[spark] object Config extends Logging {
       .booleanConf
       .createWithDefault(true)
 
+  val DRIVER_SCHEDULING_GATE_ENABLED =
+    ConfigBuilder("spark.kubernetes.submission.driverSchedulingGate.enabled")
+      .doc("In cluster mode, whether to create the driver pod with a scheduling gate and " +
+        "remove the gate once the resources the driver mounts exist. Removing the gate needs " +
+        "the `patch` verb on pods, and the scheduler must honor scheduling gates. When false, " +
+        "the driver pod can be scheduled before those resources exist.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(true)
+
   val REPORT_INTERVAL =
     ConfigBuilder("spark.kubernetes.report.interval")
       .doc("Interval between reports of the current app status in cluster mode.")
